@@ -24,21 +24,24 @@ solution.
 *** - Required parameter
 Usage: ./start.sh [arguments]
 
-    *** --name        [str]  - Name of camera/timelapse
-    *** --target-date [date] - Date of timelapse
-    *** --target-dir  [path] - A directory where images and
-                               videos can be stored
-    *** --source-base [path] - An s3 bucket, containing timelapse
-                               images. 
-    *** --target-base [path] - An s3 bucket, to store processed
-                               images, audio files and their meta-data
-  *** --sqlite-db [filename] - An sqlite db filename found relateive
-                               to target-base s3 bucket
-     --existing-audio [SHA]  - default behavior is to pick a new
-                               random audio file.
-    --genre           [str]  - Blues,Classical,Folk,Hip-Hop,Instrumental,
-                               International,Jazz,Lo-fi,Old-Time__Historic,
-                               Pop,Rock,Soul-RB (default: Hip-Hop)
+     *** --name        [str]  - Name of camera/timelapse
+     *** --target-date [date] - Date of timelapse
+     *** --target-dir  [path] - A directory where images and
+                                videos can be stored
+     *** --source-base [path] - An s3 bucket, containing timelapse
+                                images. 
+     *** --target-base [path] - An s3 bucket, to store processed
+                                images, audio files and their meta-data
+   *** --sqlite-db [filename] - An sqlite db filename found relateive
+                                to target-base s3 bucket
+      --existing-audio [SHA]  - default behavior is to pick a new
+                                random audio file.
+     --genre           [str]  - Blues,Classical,Folk,Hip-Hop,Instrumental,
+                                International,Jazz,Lo-fi,Old-Time__Historic,
+                                Pop,Rock,Soul-RB (default: Hip-Hop)
+ --slack-channel [channel-id] - Optional channel id to report completed timelapse/url
+      --slack-token   [token]   - Required token if --slack-channel is set 
+
 EOF
 
 
@@ -46,7 +49,7 @@ MIN_IMAGES_THRESHOLD=5000
 SHORT_SONG_THRESHOLD=150
 DEFAULT_START=0
 DEFAULT_END=23
-GENRE="Hip-Hop"
+GENRE="Lo-fi"
 while [[ $# -gt 0 ]] && [[ "$1" == "--"* ]]; do
   opt="$1";
   shift;
@@ -75,6 +78,10 @@ while [[ $# -gt 0 ]] && [[ "$1" == "--"* ]]; do
          DEFAULT_END=21; shift;;
       "--genre" )
          GENRE="$1"; shift;;
+      "--slack-channel" )
+         SLACK_CHANNEL_ID="$1"; shift;;
+      "--slack-token" )
+         SLACK_TOKEN="$1"; shift;;
       *) echo >&2 "Invalid option: $@"; exit 1;;
   esac
 done
@@ -110,6 +117,10 @@ if [ -z "$SQLITE_DB" ]; then
   exit 1
 fi
 
+BUCKET_PUBLIC_NAME=$(echo $TARGET_BASE | awk -F\/ '{print $3}')
+BUCKET_PUBLIC_PATH=$(echo $TARGET_BASE | sed 's/^.*'$BUCKET_PUBLIC_NAME'\///g')
+BUCKET_PUBLIC_URL="https://$BUCKET_PUBLIC_NAME.s3.amazonaws.com/$BUCKET_PUBLIC_PATH"
+
 NOW=$(date +%s)
 KEY="${NAME}_${T_YEAR}_${T_MONTH}_${T_DAY}"
 FILENAME="${KEY}.mp4"
@@ -125,9 +136,11 @@ echo "Filename:  $FILENAME"
 echo "Source:    $SOURCE_BASE"
 echo "Target:    $TARGET_BASE"
 echo "Sqlite:    $SQLITE_DB"
-echo "Audio:     $EXISTING_AUDIO"
-echo "Genre:     $GENRE"
-echo "-------------------------------------------------------------"
+if [ -z "$EXISTING_AUDIO" ]; then
+  echo "Genre:     $GENRE"
+else
+  echo "Existing Audio: $EXISTING_AUDIO.mp3"
+fi
 ##########################################################################
 
 
@@ -145,17 +158,35 @@ RAW_VIDEO_EXISTS=$(get_raw_video ${TARGET_BASE}/${SQLITE_DB} ${TARGET_DIR}/timel
 # it exists, download it, otherwise download the
 # images, and build the timelapse using ffmpeg.
 if [ -z "$RAW_VIDEO_EXISTS" ]; then
+  ##########################################################################
   echo "-------------------------------------------------------------"
   echo "Video does not exist, Pull images down from s3, and generate it"
   echo "-------------------------------------------------------------"
+  ##########################################################################
   if [ -z "$SOURCE_BASE" ]; then
     echo "A source s3 bucket+path is required to run this section"
     exit 1
   fi
-  HAS_IMAGES=$(aws s3 ls ${SOURCE_BASE}/${T_YEAR}/${T_MONTH}/${T_DAY}/${T_YEAR}_${T_MONTH}_${T_DAY}_${CURRENT_HOUR})
-  if [ -z "$HAS_IMAGES" ]; then
-    echo "There are no images in this source bucket:"
-    echo "${SOURCE_BASE}/${T_YEAR}/${T_MONTH}/${T_DAY}/${T_YEAR}_${T_MONTH}_${T_DAY}_${CURRENT_HOUR}"
+
+  echo "Checking to see if source images exist..."
+  TOTAL_IMAGES_FOR_DAY=0
+  for (( x="$DEFAULT_START"; x<="$DEFAULT_END"; x++ )); do
+    if [[ "${x}" -lt 10 ]]; then
+      CURRENT_HOUR="0$x"
+    else
+      CURRENT_HOUR=$x
+    fi
+      NUM_IMAGES=$(aws s3 ls ${SOURCE_BASE}/${T_YEAR}/${T_MONTH}/${T_DAY}/${T_YEAR}_${T_MONTH}_${T_DAY}_${CURRENT_HOUR}/ | wc -l)
+      if [ $NUM_IMAGES -eq 0 ]; then
+      echo "There are no images in this source bucket+path:"
+      tmp=$(urlencode "${SOURCE_BASE}/${T_YEAR}/${T_MONTH}/${T_DAY}/${T_YEAR}_${T_MONTH}_${T_DAY}_${CURRENT_HOUR}")
+      echo "$tmp"
+    fi
+    echo "$CURRENT_HOUR:00 - $NUM_IMAGES"
+    TOTAL_IMAGES_FOR_DAY=$((TOTAL_IMAGES_FOR_DAY + NUM_IMAGES))
+  done
+  if [ $TOTAL_IMAGES_FOR_DAY -lt $MIN_IMAGES_THRESHOLD ]; then
+    echo "Error: Staged Images under threshold ($MIN_IMAGES_THRESHOLD)"
     exit 1
   fi
   rm -rf ${TARGET_DIR}/stage
@@ -169,14 +200,16 @@ if [ -z "$RAW_VIDEO_EXISTS" ]; then
     else
       CURRENT_HOUR=$x
     fi
-    echo "Current hour: $CURRENT_HOUR"
+    echo "Getting images for the hour: $CURRENT_HOUR:00"
     aws s3 cp ${SOURCE_BASE}/${T_YEAR}/${T_MONTH}/${T_DAY}/${T_YEAR}_${T_MONTH}_${T_DAY}_${CURRENT_HOUR} ${TARGET_DIR}/stage/. --recursive --quiet
   done
 
   NUM_STAGED=$(num_files ${TARGET_DIR}/stage)
+  ##########################################################################
   echo "-------------------------------------------------------------"
-  echo "Images to render: $NUM_STAGED (This process will take a while)"
+  echo "Render Images to Video: $NUM_STAGED (This process will take a while)"
   echo "-------------------------------------------------------------"
+  ##########################################################################
   if [ $NUM_STAGED -lt $MIN_IMAGES_THRESHOLD ]; then
     echo "Error: Staged Images under threshold ($MIN_IMAGES_THRESHOLD)"
     exit 1
@@ -196,9 +229,11 @@ if [ -z "$RAW_VIDEO_EXISTS" ]; then
   put_raw_video ${TARGET_BASE}/${SQLITE_DB} ${TARGET_DIR}/timelapse.db "$KEY" "$TARGET_FILENAME" $NOW $DURATION
 else
   # There is a video file described in the raw table, download the processed video
+  ##########################################################################
   echo "-------------------------------------------------------------"
   echo "Video already exists in s3. Pull generated video from s3"
   echo "-------------------------------------------------------------"
+  ##########################################################################
   rm -rf ${TARGET_DIR}/output
   mkdir -p ${TARGET_DIR}/output
   aws s3 cp ${TARGET_BASE}/${TARGET_FILENAME} ${TARGET_DIR}/output/.
@@ -212,6 +247,7 @@ fi
 
 # Either the mp4 was downloaded, or generated. Add Audio
 if [ -z "$EXISTING_AUDIO" ]; then
+  ##########################################################################
   echo "-------------------------------------------------------------"
   echo "Get random mp3 from FreeMediaArchive.org"
   FOUND_MUSIC=0
@@ -240,9 +276,10 @@ if [ -z "$EXISTING_AUDIO" ]; then
       SONG_SHA=$(echo $THIS_MPTHREE | shasum | awk '{print $1}')
       ALREADY_REJECTED=$(cat ${TARGET_DIR}/music/rejected.txt | grep ${SONG_SHA})
       if [ -z "$ALREADY_REJECTED" ]; then
-        echo "$THIS_ARTIST"
-        echo "$THIS_MPTHREE"
-        echo "${SONG_SHA}.mp3"
+        echo "Artist: $THIS_ARTIST"
+        echo "MP3:    $THIS_MPTHREE"
+        echo "SHA:    ${SONG_SHA}.mp3"
+        echo "Backup: ${BUCKET_PUBLIC_URL}/audio/${SONG_SHA}.mp3" 
         curl -s $THIS_MPTHREE --output ${TARGET_DIR}/music/${SONG_SHA}.mp3
         THIS_DURATION=$(get_duration_in_seconds ${TARGET_DIR}/music/${SONG_SHA}.mp3)
         echo "Duration: $THIS_DURATION ?> $SHORT_SONG_THRESHOLD"
@@ -271,34 +308,41 @@ if [ -z "$EXISTING_AUDIO" ]; then
   # Push the new rejected mp3 shas to s3
   aws s3 cp ${TARGET_DIR}/music/rejected.txt ${TARGET_BASE}/${AUDIO_REJECTED_FILENAME}
 else
+  ##########################################################################
   echo "-------------------------------------------------------------"
   echo "Use existing mp3: $EXISTING_AUDIO"
   echo "-------------------------------------------------------------"
+  ##########################################################################
   SONG_SHA="$EXISTING_AUDIO"
   aws s3 cp ${TARGET_BASE}/audio/${SONG_SHA}.mp3 ${TARGET_DIR}/music/${SONG_SHA}.mp3
 fi
 
-
+##########################################################################
 echo "-------------------------------------------------------------"
 echo "Merge Audio & Video (This process will take a while)"
 echo "-------------------------------------------------------------"
+##########################################################################
 
 # Merge audio/video
 ./merge-audio-video.sh ${TARGET_DIR}/music/${SONG_SHA}.mp3 ${TARGET_DIR}/output/${FILENAME}
 
 
 NEW_DURATION=$(get_duration_in_seconds ${TARGET_DIR}/output/${KEY}_fade.mp4)
+##########################################################################
 echo "-------------------------------------------------------------"
 echo "Upload processed video to s3: $(convertsecs $NEW_DURATION)"
 echo "-------------------------------------------------------------"
+##########################################################################
 
 # Upload to s3
 aws s3 cp ${TARGET_DIR}/output/${KEY}_fade.mp4 ${TARGET_BASE}/${PROCESSED_FILENAME}
 
 
+##########################################################################
 echo "-------------------------------------------------------------"
 echo "Save meta-data to sqlite and upload db to s3"
 echo "-------------------------------------------------------------"
+##########################################################################
 
 # Save meta-data about processed video (key, name, filename, year, month, day, audio, created, duration)
 put_video ${TARGET_BASE}/${SQLITE_DB} ${TARGET_DIR}/timelapse.db "$KEY" "$NAME" "$PROCESSED_FILENAME" $T_YEAR $T_MONTH $T_DAY "$SONG_SHA" $NOW $NEW_DURATION
@@ -311,7 +355,20 @@ put_video ${TARGET_BASE}/${SQLITE_DB} ${TARGET_DIR}/timelapse.db "$KEY" "$NAME" 
 ENDED=$(date +%s)
 FINISHED=$((ENDED-NOW))
 runtime=$(convertsecs $FINISHED)
+##########################################################################
 echo "-------------------------------------------------------------"
+echo "Processing Complete!!!"
 echo "Timelapse Processing Time: $runtime"
+echo "Video: ${BUCKET_PUBLIC_URL}/${PROCESSED_FILENAME}" 
 echo "-------------------------------------------------------------"
+##########################################################################
 
+
+if ! [ -z "$SLACK_CHANNEL_ID" ]; then
+  if [ -z "$SLACK_TOKEN" ]; then
+    echo "Slack Token is required to run this action."
+    exit 0
+  else
+    slack_message $SLACK_TOKEN $SLACK_CHANNEL_ID "Timelapse Complete: ${BUCKET_PUBLIC_URL}/${PROCESSED_FILENAME}"
+  fi
+fi
